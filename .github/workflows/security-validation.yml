@@ -1,0 +1,118 @@
+name: Security compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports:
+          - 27017/tcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install and check resolved dependencies
+        run: |
+          python -m pip install --upgrade pip==26.2.2 setuptools==84.2.1
+          python -m pip install -r bot/requirements.txt
+          python -m pip check
+          python -m pip inspect > dependency-tree.json
+          python -m pip list --format=json > resolved.json
+          python -c "import pip; from pathlib import Path; print((Path(pip.__file__).parent / '_vendor/vendor.txt').read_text())" > installer-vendors.txt
+          python -c "import json, setuptools; from pathlib import Path; from importlib.metadata import distributions; print(json.dumps([{'name': d.metadata['Name'], 'version': d.version} for d in distributions(path=[str(Path(setuptools.__file__).parent / '_vendor')])]))" > setuptools-vendors.json
+          python -m compileall -q bot
+      - name: Isolated callback and MongoDB smoke
+        env:
+          MONGO_PORT: ${{ job.services.mongodb.ports[27017] }}
+        run: |
+          python - <<'PY'
+          import ast, asyncio, datetime, os, string, time
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import AsyncMock
+          import pymongo, telegram
+          from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+          from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
+          client = pymongo.MongoClient("127.0.0.1", int(os.environ["MONGO_PORT"]), serverSelectionTimeoutMS=30000)
+          print("Isolated MongoDB:", client.server_info()["version"])
+          db = client.security_smoke
+          bot = SimpleNamespace(send_message=AsyncMock())
+          messages = dict(start="Welcome {}", menu="Menu", add_stack="Add", updated_stack="Updated",
+                          muted="Muted", unmuted="Unmuted", broadcast="{}", finished_broadcast="{} {} {}")
+          ns = dict(asyncio=asyncio, datetime=datetime, string=string, time=time, db=db, bot=bot,
+                    config={"messages": messages}, LinkPreviewOptions=LinkPreviewOptions,
+                    InlineKeyboardButton=InlineKeyboardButton, InlineKeyboardMarkup=InlineKeyboardMarkup)
+
+          def load_functions(path, namespace):
+              tree = ast.parse(Path(path).read_text())
+              definitions = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+              exec(compile(ast.Module(body=definitions, type_ignores=[]), path, "exec"), namespace)
+              return tree
+
+          tree = load_functions("bot/devjobhub.py", ns)
+          application = Application.builder().token("123456:OFFLINE_SMOKE_ONLY").build()
+          ns.update(dispatcher=application, CommandHandler=CommandHandler, MessageHandler=MessageHandler, filters=filters)
+          registration = [n for n in tree.body if
+                          isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id.endswith("_handler") for t in n.targets)
+                          or isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == "add_handler"]
+          exec(compile(ast.Module(body=registration, type_ignores=[]), "handlers", "exec"), ns)
+          assert len(application.handlers[0]) == 11 and application.concurrent_updates == 1
+
+          def update(text):
+              chat = telegram.Chat(42, "private", first_name="Smoke")
+              message = telegram.Message(1, datetime.datetime.now(datetime.timezone.utc), chat, text=text)
+              return telegram.Update(1, message=message)
+
+          async def smoke():
+              context = SimpleNamespace(bot=bot)
+              await ns["start"](update("/start"), context)
+              await ns["add_stack"](update("/add_stack"), context)
+              await ns["echo"](update("Python,C++"), context)
+              assert db.user_stack.count_documents({"chat_id": 42}) == 2
+              user = db.users.find_one({"chat_id": 42})
+              assert user["last_command"] is None and user["active"] and not user["mute"]
+              await ns["mute"](update("/mute"), context)
+              await ns["mute"](update("/mute"), context)
+              db.users.update_one({"chat_id": 42}, {"$set": {"admin": True}})
+              await ns["broadcast"](update("/broadcast"), context)
+              await ns["echo"](update("Offline broadcast"), context)
+              assert db.users.find_one({"chat_id": 42})["last_command"] is None
+              cron = dict(ns)
+              load_functions("bot/devjobhub_cron.py", cron)
+              db.jobs.insert_one({"href": "https://example.invalid/job"})
+              before = bot.send_message.await_count
+              await cron["send_job_to_users"]("python", [], "Job", "https://example.invalid/job")
+              assert bot.send_message.await_count == before + 1
+              assert "python" in db.jobs.find_one({})["stacks"]
+              print("Callback registration, subscriptions, broadcast and job delivery passed; Telegram mocked.")
+
+          try:
+              asyncio.run(smoke())
+          finally:
+              client.drop_database("security_smoke")
+              client.close()
+          assert not Path(telegram.__file__).parent.joinpath("vendor", "ptb_urllib3").exists()
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resolved-dependencies
+          path: |
+            dependency-tree.json
+            resolved.json
+            installer-vendors.txt
+            setuptools-vendors.json
+          retention-days: 7

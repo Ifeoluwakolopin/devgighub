@@ -1,10 +1,10 @@
 import json
 import time
 import datetime
-from multiprocessing import Pool
+import asyncio
 import pymongo
 import telegram
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 import scraper
 
 config = json.load(open("config.json"))
@@ -13,16 +13,17 @@ db = client[config["db"]["db_name"]]
 bot = telegram.Bot(token=config["token"])
 
 
-def send_job_listing(args):
-    try:
-        bot.send_message(args[0], args[1], parse_mode="HTML",
-                         disable_web_page_preview="True", reply_markup=InlineKeyboardMarkup(args[2]))
-    except Exception as e:
-        if str(e) == "Forbidden: bot was blocked by the user":
-            return args[0]
+async def send_job_listing(args, semaphore):
+    async with semaphore:
+        try:
+            await bot.send_message(args[0], args[1], parse_mode="HTML",
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True), reply_markup=InlineKeyboardMarkup(args[2]))
+        except Exception as e:
+            if str(e) in ("Forbidden: bot was blocked by the user", "bot was blocked by the user"):
+                return args[0]
 
 
-def send_job_to_users(description, tags, job_message, job_url):
+async def send_job_to_users(description, tags, job_message, job_url):
     all_stack = [i["_id"]
                  for i in db.user_stack.aggregate([{"$group": {"_id": "$stack"}}])]
     valid_stack = list(set([i for i in all_stack if i in description.lower()
@@ -34,14 +35,15 @@ def send_job_to_users(description, tags, job_message, job_url):
     valid_users = db.users.find(
         {"active": True, "mute": False, "chat_id": {"$in": list(users)}})
     markup = [[InlineKeyboardButton("Apply", url=job_url)]]
-    with Pool(5) as p:
-        blocked_users = p.map(send_job_listing, [
-            [i["chat_id"], job_message, markup] for i in valid_users])
+    semaphore = asyncio.Semaphore(5)
+    blocked_users = await asyncio.gather(*(
+        send_job_listing([i["chat_id"], job_message, markup], semaphore)
+        for i in valid_users))
     db.users.update_many({"chat_id": {"$in": [i for i in blocked_users if i != None]}}, {
                          "$set": {"active": False}})
 
 
-def weworkremotely():
+async def weworkremotely():
     jobs = []
     try:
         for job in scraper.weworkremotely_jobs():
@@ -60,11 +62,11 @@ def weworkremotely():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["info"]["location"], job["info"]["job_type"], ", ".join(job["details"]["tags"]), "", job["info"]["href"])
-        send_job_to_users(job["details"]["description"], job["details"]
+        await send_job_to_users(job["details"]["description"], job["details"]
                           ["tags"], job_message, job["info"]["href"])
 
 
-def remoteok():
+async def remoteok():
     jobs = []
     try:
         for job in scraper.remoteok_jobs():
@@ -79,11 +81,11 @@ def remoteok():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["info"]["location"], job["info"]["job_type"], ", ".join(job["info"]["tags"]), "", job["info"]["href"])
-        send_job_to_users(job["info"]["description"], job["info"]
+        await send_job_to_users(job["info"]["description"], job["info"]
                           ["tags"], job_message, job["info"]["href"])
 
 
-def employremotely():
+async def employremotely():
     jobs = []
     try:
         for job in scraper.employremotely_jobs():
@@ -102,11 +104,11 @@ def employremotely():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["info"]["location"], job["info"]["job_type"], ", ".join(job["details"]["tags"]), "⏰ <b>Deadline:</b> {}\n".format(job["details"]["deadline"]), job["info"]["href"])
-        send_job_to_users(job["details"]["description"], job["details"]
+        await send_job_to_users(job["details"]["description"], job["details"]
                           ["tags"], job_message, job["info"]["href"])
 
 
-def remotive():
+async def remotive():
     jobs = []
     try:
         for job in scraper.remotive_jobs():
@@ -125,11 +127,11 @@ def remotive():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["info"]["location"], "Not Specified", ", ".join(job["info"]["tags"]), "", job["info"]["href"])
-        send_job_to_users(job["details"]["description"], job["info"]
+        await send_job_to_users(job["details"]["description"], job["info"]
                           ["tags"], job_message, job["info"]["href"])
 
 
-def stackoverflow():
+async def stackoverflow():
     jobs = []
     try:
         for job in scraper.stackoverflow_jobs():
@@ -148,10 +150,10 @@ def stackoverflow():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["info"]["location"], "Not Specified", ", ".join(job["info"]["tags"]), "", job["info"]["href"])
-        send_job_to_users(job["details"]["description"], job["info"]
+        await send_job_to_users(job["details"]["description"], job["info"]
                           ["tags"], job_message, job["info"]["href"])
 
-def remoteco():
+async def remoteco():
     jobs = []
     try:
         for job in scraper.remoteco_jobs():
@@ -170,10 +172,10 @@ def remoteco():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["details"]["location"], "Not Specified", "None", "", job["info"]["href"])
-        send_job_to_users(job["details"]["description"],
+        await send_job_to_users(job["details"]["description"],
                           [], job_message, job["info"]["href"])
 
-def pythonorg():
+async def pythonorg():
     jobs = []
     try:
         for job in scraper.pythonorg_jobs():
@@ -192,11 +194,11 @@ def pythonorg():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["details"]["location"], "Not Specified", ", ".join(job["info"]["tags"]), "📅 <b>Date Posted:</b> {}\n".format(job["info"]["date_posted"]), job["info"]["href"])
-        send_job_to_users(job["details"]["description"],
+        await send_job_to_users(job["details"]["description"],
                           job["info"]["tags"], job_message, job["info"]["href"])
 
 
-def hackerrank():
+async def hackerrank():
     jobs = []
     try:
         for job in scraper.hackerrank_jobs():
@@ -215,29 +217,38 @@ def hackerrank():
             {**job, "href": job["info"]["href"], "date": datetime.datetime.now()})
         job_message = config["messages"]["job_message"].format(
             job["info"]["role"], job["info"]["company"], job["info"]["location"], "Not Specified", "None", "🕑 <b>Experience:</b> {}\n".format(job["info"]["experience"]), job["info"]["href"])
-        send_job_to_users(job["details"]["description"],
+        await send_job_to_users(job["details"]["description"],
                           [], job_message, job["info"]["href"])
 
 
-if __name__ == "__main__":
+async def main():
+    async with bot:
+        await run_scrapers()
+
+
+async def run_scrapers():
     while True:
         start = time.time()
         print("Scraping weworkremotely...")
-        weworkremotely()
+        await weworkremotely()
         print("Scraping remoteok...")
-        remoteok()
+        await remoteok()
         print("Scraping employremotely...")
-        employremotely()
+        await employremotely()
         print("Scraping remotive...")
-        remotive()
+        await remotive()
         print("Scraping stackoverflow jobs...")
-        stackoverflow()
+        await stackoverflow()
         print("Scraping remoteco...")
-        remoteco()
+        await remoteco()
         print("Scraping pythonorg...")
-        pythonorg()
+        await pythonorg()
         print("Scraping hackerrank...")
-        hackerrank()
+        await hackerrank()
         print("Taking a nap... Scraping took {} seconds".format(
             int(time.time() - start)))
-        time.sleep(config["scrape_interval"] * 60)
+        await asyncio.sleep(config["scrape_interval"] * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

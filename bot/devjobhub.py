@@ -3,18 +3,18 @@ import logging
 import time
 import string
 import json
-from multiprocessing import Pool
+import asyncio
 import pymongo
 import telegram
-from telegram.ext import Updater
+from telegram import LinkPreviewOptions
+from telegram.ext import Application
 from telegram.ext import CommandHandler
-from telegram.ext import MessageHandler, Filters
+from telegram.ext import MessageHandler, filters
 
 config = json.load(open("config.json"))
-bot = telegram.Bot(token=config["token"])
-updater = Updater(
-    token=config["token"], use_context=True)
-dispatcher = updater.dispatcher
+application = Application.builder().token(config["token"]).build()
+bot = application.bot
+dispatcher = application
 client = pymongo.MongoClient(config["db"]["host"], config["db"]["port"])
 db = client[config["db"]["db_name"]]
 logging.basicConfig(
@@ -27,86 +27,87 @@ def parse_stack(stack):
     return "".join([i for i in stack if i in accepted_chars])
 
 
-def send_broadcast(args):
-    try:
-        bot.send_message(chat_id=args[0], text=args[1],
-                         disable_web_page_preview="True")
-    except Exception as e:
-        if str(e) == "Forbidden: bot was blocked by the user":
-            return args[0]
+async def send_broadcast(args, semaphore):
+    async with semaphore:
+        try:
+            await bot.send_message(chat_id=args[0], text=args[1],
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except Exception as e:
+            if str(e) in ("Forbidden: bot was blocked by the user", "bot was blocked by the user"):
+                return args[0]
 
 
-def start(update, context):
+async def start(update, context):
     chat_id = update.effective_chat.id
     if not db.users.find_one({"chat_id": chat_id}):
         db.users.insert_one(
             {"chat_id": chat_id, "last_command": None, "admin": False, "mute": False, "date": datetime.datetime.now()})
     db.users.update_one({"chat_id": chat_id}, {"$set": {"active": True}})
-    context.bot.send_message(
-        chat_id=chat_id, text=config["messages"]["start"].format(update["message"]["chat"]["first_name"]), parse_mode="Markdown", disable_web_page_preview="True")
-    context.bot.send_message(
+    await context.bot.send_message(
+        chat_id=chat_id, text=config["messages"]["start"].format(update["message"]["chat"]["first_name"]), parse_mode="Markdown", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await context.bot.send_message(
         chat_id=chat_id, text=config["messages"]["menu"])
     db.users.update_one({"chat_id": chat_id}, {"$set": {"last_command": None}})
 
 
-def menu(update, context):
+async def menu(update, context):
     chat_id = update.effective_chat.id
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=chat_id, text=config["messages"]["menu"])
     db.users.update_one({"chat_id": chat_id}, {"$set": {"last_command": None}})
 
 
-def view_stack(update, context):
+async def view_stack(update, context):
     chat_id = update.effective_chat.id
     stack = list(db.user_stack.find({"chat_id": chat_id}))
     if stack == []:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["empty_stack"])
     else:
         stack = [i["stack"].capitalize() for i in stack]
         stack_message = config["messages"]["stack"].format(
             ", ".join(stack))
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=stack_message)
     db.users.update_one({"chat_id": chat_id}, {"$set": {"last_command": None}})
 
 
-def add_stack(update, context):
+async def add_stack(update, context):
     chat_id = update.effective_chat.id
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=chat_id, text=config["messages"]["add_stack"])
     last_command = "add_stack"
     db.users.update_one({"chat_id": chat_id}, {
                         "$set": {"last_command": last_command}})
 
 
-def remove_stack(update, context):
+async def remove_stack(update, context):
     chat_id = update.effective_chat.id
     stack = list(db.user_stack.find({"chat_id": chat_id}))
     if stack == []:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["empty_stack"])
     else:
         stack = [i["stack"].capitalize() for i in stack]
         stack_message = config["messages"]["remove_stack"].format(
             ", ".join(stack))
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=stack_message)
         last_command = "remove_stack"
         db.users.update_one({"chat_id": chat_id}, {
                             "$set": {"last_command": last_command}})
 
 
-def get_random(update, context):
+async def get_random(update, context):
     chat_id = update.effective_chat.id
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=chat_id, text=config["messages"]["get_random"])
     last_command = "get_random"
     db.users.update_one({"chat_id": chat_id}, {
                         "$set": {"last_command": last_command}})
 
 
-def stats(update, context):
+async def stats(update, context):
     chat_id = update.effective_chat.id
     total_users = db.users.count_documents({})
     total_jobs = db.jobs.count_documents({})
@@ -117,23 +118,23 @@ def stats(update, context):
         user_stack_stats += "`{}` - {:.2f}%\n".format(i["_id"].capitalize(),
                                                       i["count"] / total_job_stack * 100)
 
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=chat_id, text=config["messages"]["stats"].format(total_jobs, total_users, user_stack_stats, time.strftime("%d/%m/%Y %H:%M:%S UTC")), parse_mode="Markdown")
     db.users.update_one({"chat_id": chat_id}, {"$set": {"last_command": None}})
 
 
-def donate(update, context):
+async def donate(update, context):
     chat_id = update.effective_chat.id
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=chat_id, text=config["messages"]["donate"])
     db.users.update_one({"chat_id": chat_id}, {"$set": {"last_command": None}})
 
 
-def broadcast(update, context):
+async def broadcast(update, context):
     chat_id = update.effective_chat.id
     admin_status = db.users.find_one({"chat_id": chat_id, "admin": True})
     if admin_status:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["broadcast"].format(db.users.count_documents({})))
         db.users.update_one({"chat_id": chat_id}, {
                             "$set": {"last_command": "broadcast"}})
@@ -143,20 +144,20 @@ def broadcast(update, context):
                             "$set": {"last_command": None}})
 
 
-def mute(update, context):
+async def mute(update, context):
     chat_id = update.effective_chat.id
     bot_user = db.users.find_one({"chat_id": chat_id})
     if bot_user["mute"]:
         db.users.update_one({"chat_id": chat_id}, {"$set": {"mute": False}})
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["unmuted"])
     else:
         db.users.update_one({"chat_id": chat_id}, {"$set": {"mute": True}})
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["muted"])
 
 
-def echo(update, context):
+async def echo(update, context):
     chat_id = update.effective_chat.id
     bot_user = db.users.find_one({"chat_id": chat_id})
     last_command = bot_user["last_command"] if bot_user != None else None
@@ -168,7 +169,7 @@ def echo(update, context):
             db.user_stack.delete_many({"chat_id": chat_id, "stack": i})
         db.user_stack.insert_many(
             [{"chat_id": chat_id, "stack": i} for i in stack])
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["updated_stack"])
     elif last_command == "remove_stack":
         stack = ",".join(update.message.text.split("\n"))
@@ -176,7 +177,7 @@ def echo(update, context):
                  for i in stack.split(",") if i.strip() != ""]
         for i in stack:
             db.user_stack.delete_many({"chat_id": chat_id, "stack": i})
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["updated_stack"])
     elif last_command == "get_random":
         stack = update.message.text.strip().lower()
@@ -188,23 +189,24 @@ def echo(update, context):
                 i["info"]["role"], i["href"], "{}/{}/{}".format(i["date"].day, i["date"].month, i["date"].year))
         if jobs == "":
             jobs = config["messages"]["empty_random"]
-        context.bot.send_message(
-            chat_id=chat_id, text=jobs, disable_web_page_preview="True")
+        await context.bot.send_message(
+            chat_id=chat_id, text=jobs, link_preview_options=LinkPreviewOptions(is_disabled=True))
     elif last_command == "broadcast":
-        with Pool(5) as p:
-            blocked_users = p.map(send_broadcast, [
-                                  [i["chat_id"], update.message.text] for i in db.users.find({"active": True})])
+        semaphore = asyncio.Semaphore(5)
+        blocked_users = await asyncio.gather(*(
+            send_broadcast([i["chat_id"], update.message.text], semaphore)
+            for i in db.users.find({"active": True})))
         db.users.update_many({"chat_id": {"$in": [i for i in blocked_users if i != None]}}, {
                              "$set": {"active": False}})
         users_count = db.users.count_documents({})
         total_delivered = db.users.count_documents({"active": True})
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["finished_broadcast"].format(users_count, total_delivered, total_delivered / users_count * 100))
     else:
         if bot_user["admin"]:
-            context.bot.send_message(
-                chat_id=chat_id, text=update.message.text, disable_web_page_preview="True")
-        context.bot.send_message(
+            await context.bot.send_message(
+                chat_id=chat_id, text=update.message.text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await context.bot.send_message(
             chat_id=chat_id, text=config["messages"]["unknown"])
     db.users.update_one({"chat_id": chat_id}, {"$set": {"last_command": None}})
 
@@ -219,7 +221,7 @@ remove_stack_handler = CommandHandler("remove_stack", remove_stack)
 get_random_handler = CommandHandler("get_random", get_random)
 mute_handler = CommandHandler("mute", mute)
 broadcast_handler = CommandHandler("broadcast", broadcast)
-echo_handler = MessageHandler(Filters.text & (~Filters.command), echo)
+echo_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), echo)
 
 dispatcher.add_handler(start_handler)
 dispatcher.add_handler(menu_handler)
@@ -233,4 +235,5 @@ dispatcher.add_handler(mute_handler)
 dispatcher.add_handler(broadcast_handler)
 dispatcher.add_handler(echo_handler)
 
-updater.start_polling()
+if __name__ == "__main__":
+    application.run_polling()
