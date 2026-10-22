@@ -25,3 +25,9 @@ Do not start either worker for validation: they contact Telegram, MongoDB,
 and/or job sites. Syntax checking (`python -m compileall -q bot`) is safe.
 Hosted validation uses synthetic Telegram updates and an isolated MongoDB
 service, never production credentials.
+
+Installer limitation (2026-10-22): current pip 26.2.2 still bundles urllib3
+2.7.0, which has advisories fixed in 2.8.0. The application pin does not patch
+pip's private copy. Hosted artifacts inventory these installation-tool copies;
+the bot itself uses the maintained HTTPX transport. A newer patched installer
+release is still needed; this is not a claim that every bundled tool is clean.
