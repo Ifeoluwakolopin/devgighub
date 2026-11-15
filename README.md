@@ -5,7 +5,7 @@ Get personalised programming job postings right to your telegram with ease [http
 ## Runtime and dependencies
 
 Use Python 3.11 and MongoDB 4.4 or newer (prefer a currently supported
-MongoDB release). PyMongo 4.18.2 no longer supports older servers; check
+MongoDB release). PyMongo 4.18.3 no longer supports older servers; check
 the server version before deployment. No server upgrade or deployment is
 performed by installing these dependencies.
 
